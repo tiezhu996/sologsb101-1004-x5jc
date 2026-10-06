@@ -10,13 +10,27 @@ export const WORK_ORDER_STATE_LABEL: Record<WorkOrderState, string> = {
   done: '已完成',
 };
 
-/** 作业单状态流转 */
+/** 作业单状态流转（含返工回退） */
 export const WORK_ORDER_STATE_FLOW: Record<WorkOrderState, WorkOrderState[]> = {
   planned: ['issued'],
-  issued: ['working'],
-  working: ['done'],
-  done: [],
+  issued: ['working', 'planned'],
+  working: ['done', 'issued'],
+  done: ['working'],
 };
+
+/** 回退动作的按钮 / 提示文案：键为 原状态→目标状态 */
+export const WORK_ORDER_ROLLBACK_LABEL: Partial<Record<WorkOrderState, Partial<Record<WorkOrderState, string>>>> = {
+  done: { working: '班组返工，退回作业中' },
+  working: { issued: '退回已下达' },
+  issued: { planned: '退回待编排' },
+};
+
+/** 判断一次状态变更是否为回退（状态在流转轴上后退） */
+const STATE_RANK: Record<WorkOrderState, number> = { planned: 0, issued: 1, working: 2, done: 3 };
+
+export function isRollback(from: WorkOrderState, to: WorkOrderState): boolean {
+  return STATE_RANK[to] < STATE_RANK[from];
+}
 
 /** 天窗作业单 */
 export interface WorkOrder extends Revisioned {
@@ -37,6 +51,11 @@ export interface WorkOrder extends Revisioned {
   members: string[];
   /** 状态 */
   state: WorkOrderState;
+  /**
+   * 本单推进到已完成时「实际带出销号」的病害 id（仅当时仍为待修、由本单销号的病害）。
+   * 回退时只撤销这些病害；重新完成时重算覆盖。
+   */
+  solvedFaultIds: string[];
   createdAt: string;
   updatedAt: string;
 }

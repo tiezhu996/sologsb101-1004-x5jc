@@ -27,16 +27,19 @@ import {
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import AssignmentTurnedInIcon from '@mui/icons-material/AssignmentTurnedIn';
+import UndoIcon from '@mui/icons-material/Undo';
 import DownloadIcon from '@mui/icons-material/Download';
 import { useAppDispatch, useAppSelector } from '../hooks/useAppStore';
-import { advanceWorkOrder, selectWindowStats, selectWorkOrderViews } from '../stores/workOrderStore';
+import { advanceWorkOrder, selectWindowStats, selectWorkOrderViews, type RollbackReviewItem } from '../stores/workOrderStore';
 import { selectFaultViews } from '../stores/faultStore';
 import {
   WORK_ORDER_STATE_FLOW,
   WORK_ORDER_STATE_LABEL,
+  WORK_ORDER_ROLLBACK_LABEL,
+  isRollback,
   type WorkOrderState,
 } from '../types/workOrder';
-import { FAULT_SEVERITY_LABEL } from '../types/fault';
+import { FAULT_PART_LABEL, FAULT_SEVERITY_LABEL, FAULT_TYPE_LABEL } from '../types/fault';
 import { ROUTES } from '../router/routes';
 import { formatDuration, nowDateTime } from '../utils/window';
 import { downloadCsv, share } from '../utils/format';
@@ -57,6 +60,7 @@ export default function ProgressView() {
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['state', 'yard']);
   const [toast, setToast] = useState('');
+  const [reviewNotice, setReviewNotice] = useState<{ code: string; items: RollbackReviewItem[] } | null>(null);
 
   const rows = useMemo(() => {
     const lower = keyword.trim().toLowerCase();
@@ -103,7 +107,12 @@ export default function ProgressView() {
       if (next === 'done') {
         setToast(`${code} 已完成，回写销号 ${result.solvedCount} 处病害`);
       } else {
-        setToast(`${code} 已推进为「${WORK_ORDER_STATE_LABEL[next]}」`);
+        // 回退（含班组返工、已下达退回待编排）：只撤销本单实际带出的销号，其余保留
+        setReviewNotice(result.review.length > 0 ? { code, items: result.review } : null);
+        setToast(
+          `${code} 已退回「${WORK_ORDER_STATE_LABEL[next]}」，撤销本单销号 ${result.revokedCount} 处` +
+            (result.review.length > 0 ? `，${result.review.length} 处旧销号需人工核对` : ''),
+        );
       }
     } catch (error) {
       setToast(`推进失败：${error instanceof Error ? error.message : '未知错误'}`);
@@ -139,7 +148,8 @@ export default function ProgressView() {
             作业进度与销号回写
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            按天窗批次推进状态：待编排 → 已下达 → 作业中 → 已完成；推进到已完成时自动回写关联病害销号。
+            按天窗批次推进状态：待编排 → 已下达 → 作业中 → 已完成；完成时自动回写关联病害销号，
+            回退（含班组返工）只撤销本单实际带出的销号，手工销号与其它单的销号保留。
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -257,18 +267,22 @@ export default function ProgressView() {
                       </Typography>
                     </Box>
                     <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                      {nextStates.map((next) => (
-                        <Button
-                          key={next}
-                          size="small"
-                          variant={next === 'done' ? 'contained' : 'outlined'}
-                          color={next === 'done' ? 'success' : 'primary'}
-                          startIcon={next === 'done' ? <AssignmentTurnedInIcon /> : <PlayArrowIcon />}
-                          onClick={() => void advance(order.id, next, order.code)}
-                        >
-                          推进为{WORK_ORDER_STATE_LABEL[next]}
-                        </Button>
-                      ))}
+                      {nextStates.map((next) => {
+                        const rollback = isRollback(order.state, next);
+                        const rollbackText = WORK_ORDER_ROLLBACK_LABEL[order.state]?.[next];
+                        return (
+                          <Button
+                            key={next}
+                            size="small"
+                            variant={next === 'done' ? 'contained' : rollback ? 'outlined' : 'outlined'}
+                            color={next === 'done' ? 'success' : rollback ? 'warning' : 'primary'}
+                            startIcon={next === 'done' ? <AssignmentTurnedInIcon /> : rollback ? <UndoIcon /> : <PlayArrowIcon />}
+                            onClick={() => void advance(order.id, next, order.code)}
+                          >
+                            {rollback ? rollbackText ?? `退回${WORK_ORDER_STATE_LABEL[next]}` : `推进为${WORK_ORDER_STATE_LABEL[next]}`}
+                          </Button>
+                        );
+                      })}
                       {order.state === 'done' ? (
                         <Chip icon={<CheckCircleIcon />} color="success" label="已完成并回写销号" />
                       ) : null}
@@ -298,42 +312,72 @@ export default function ProgressView() {
                           <TableCell>巡检日期</TableCell>
                           <TableCell>销号状态</TableCell>
                           <TableCell>销号时间</TableCell>
+                          <TableCell>销号来源</TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
-                        {relatedFaults.map((fault) => (
-                          <TableRow key={fault.id} hover>
-                            <TableCell>
-                              {fault.yardName} · {fault.switchCode}
-                            </TableCell>
-                            <TableCell>
-                              {fault.part} / {fault.type}
-                            </TableCell>
-                            <TableCell>
-                              <Chip
-                                size="small"
-                                label={FAULT_SEVERITY_LABEL[fault.severity]}
-                                sx={{
-                                  backgroundColor: `${SEVERITY_HEX[fault.severity]}1a`,
-                                  color: SEVERITY_HEX[fault.severity],
-                                }}
-                              />
-                            </TableCell>
-                            <TableCell>{fault.inspectionDate}</TableCell>
-                            <TableCell>
-                              <Chip
-                                size="small"
-                                variant="outlined"
-                                color={fault.state === 'solved' ? 'success' : 'warning'}
-                                label={fault.state === 'solved' ? '已销号' : '待修'}
-                              />
-                            </TableCell>
-                            <TableCell>{fault.solvedAt ?? '—'}</TableCell>
-                          </TableRow>
-                        ))}
+                        {relatedFaults.map((fault) => {
+                          const reviewItem = reviewNotice?.code === order.code
+                            ? reviewNotice.items.find((item) => item.faultId === fault.id)
+                            : undefined;
+                          return (
+                            <TableRow key={fault.id} hover selected={Boolean(reviewItem)}>
+                              <TableCell>
+                                {fault.yardName} · {fault.switchCode}
+                              </TableCell>
+                              <TableCell>
+                                {FAULT_PART_LABEL[fault.part]} / {FAULT_TYPE_LABEL[fault.type]}
+                              </TableCell>
+                              <TableCell>
+                                <Chip
+                                  size="small"
+                                  label={FAULT_SEVERITY_LABEL[fault.severity]}
+                                  sx={{
+                                    backgroundColor: `${SEVERITY_HEX[fault.severity]}1a`,
+                                    color: SEVERITY_HEX[fault.severity],
+                                  }}
+                                />
+                              </TableCell>
+                              <TableCell>{fault.inspectionDate}</TableCell>
+                              <TableCell>
+                                <Chip
+                                  size="small"
+                                  variant="outlined"
+                                  color={fault.state === 'solved' ? 'success' : 'warning'}
+                                  label={fault.state === 'solved' ? '已销号' : '待修'}
+                                />
+                              </TableCell>
+                              <TableCell>{fault.solvedAt ?? '—'}</TableCell>
+                              <TableCell>
+                                {fault.state === 'solved' ? (
+                                  reviewItem ? (
+                                    <Tooltip title="旧数据缺少本单销号来源记录，已保留销号，请到病害页人工核对后再撤销">
+                                      <Chip size="small" color="warning" variant="outlined" label="待人工核对" />
+                                    </Tooltip>
+                                  ) : fault.solvedByWorkOrderCode ? (
+                                    <Chip
+                                      size="small"
+                                      color="success"
+                                      variant="outlined"
+                                      label={`作业单 ${fault.solvedByWorkOrderCode}`}
+                                    />
+                                  ) : fault.closureInferred ? (
+                                    <Chip size="small" variant="outlined" label="旧来源待核对" />
+                                  ) : (
+                                    <Chip size="small" variant="outlined" label="手工销号" />
+                                  )
+                                ) : (
+                                  <Typography variant="caption" color="text.secondary">
+                                    —
+                                  </Typography>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })}
                         {relatedFaults.length === 0 ? (
                           <TableRow>
-                            <TableCell colSpan={6} align="center">
+                            <TableCell colSpan={7} align="center">
                               <Typography variant="caption" color="text.secondary">
                                 关联病害已被删除或尚未加载
                               </Typography>
@@ -351,9 +395,34 @@ export default function ProgressView() {
       </Box>
 
       <Alert severity="info" sx={{ mt: 2 }}>
-        说明：天窗作业单推进到「已完成」时，系统会把该单关联的全部待修病害一次性置为已销号并记录销号时间，
-        可在「病害评定与销号」页撤销销号。
+        说明：作业单推进到「已完成」时，仅把本单关联、当时仍待修的病害置为已销号并记录来源；
+        原来手工销过、别的作业单先销过的病害不受影响。回退（已完成→作业中、已下达→待编排）时，
+        只撤销本单实际带出的销号；同一病害关联多张单时，以最早完成的单认定销号来源，后来的单回退只改状态。
+        旧数据缺少来源记录的，会列出待人工核对，不会自动撤销。
       </Alert>
+
+      {reviewNotice ? (
+        <Alert severity="warning" sx={{ mt: 1.5 }} onClose={() => setReviewNotice(null)}>
+          <Typography variant="body2" fontWeight={600}>
+            {reviewNotice.code} 回退时有 {reviewNotice.items.length} 处已销号病害缺少本单来源记录，已保留销号，请人工核对：
+          </Typography>
+          <Stack component="ul" spacing={0.25} sx={{ m: 0.5, pl: 2 }}>
+            {reviewNotice.items.map((item) => {
+              const fault = faults.find((row) => row.id === item.faultId);
+              return (
+                <li key={item.faultId}>
+                  <Typography variant="body2">
+                    {fault ? `${fault.yardName} · ${fault.switchCode} · ${FAULT_PART_LABEL[fault.part]}/${FAULT_TYPE_LABEL[fault.type]}` : item.faultId}
+                    {' '}— 销号时间 {item.solvedAt ?? '未知'}
+                    {item.inferredFromCode ? `，迁移时推断来源 ${item.inferredFromCode}` : '，无任何来源记录'}
+                    ；确认确属本单后，可到「病害评定与销号」页手工撤销。
+                  </Typography>
+                </li>
+              );
+            })}
+          </Stack>
+        </Alert>
+      ) : null}
 
       <Snackbar
         open={Boolean(toast)}

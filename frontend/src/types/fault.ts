@@ -59,6 +59,12 @@ export interface Fault extends Revisioned {
   state: FaultState;
   /** 销号时间 */
   solvedAt: string | null;
+  /**
+   * 当前销号来源作业单 id（回写销号时写入，回退撤销后清空）。
+   * 手工销号、旧数据无来源时为 null。
+   * 同一病害关联多张单时，以最早完成（最早带出销号）的单为准，后来的单不改本字段。
+   */
+  solvedByWorkOrderId: string | null;
   createdAt: string;
 }
 
@@ -83,6 +89,10 @@ export interface FaultView extends Fault {
   planned: boolean;
   /** 关联作业单号 */
   workOrderCodes: string[];
+  /** 销号来源作业单编号（回写销号时有值；手工销号 / 无来源旧数据为 null） */
+  solvedByWorkOrderCode: string | null;
+  /** 是否为旧库迁移推断的销号来源（需人工核对） */
+  closureInferred: boolean;
 }
 
 /** 部件巡检要点 */

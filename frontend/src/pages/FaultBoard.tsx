@@ -418,6 +418,15 @@ export default function FaultBoard() {
                           {row.solvedAt}
                         </Typography>
                       ) : null}
+                      {row.state === 'solved' ? (
+                        <Typography variant="caption" display="block" color={row.closureInferred ? 'warning.main' : 'text.secondary'}>
+                          {row.solvedByWorkOrderCode
+                            ? `作业单回写 ${row.solvedByWorkOrderCode}`
+                            : row.closureInferred
+                              ? '旧来源待核对'
+                              : '手工销号'}
+                        </Typography>
+                      ) : null}
                     </TableCell>
                     <TableCell>
                       {row.planned ? (

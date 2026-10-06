@@ -55,7 +55,10 @@ import {
   MEMBER_LIBRARY,
   WORK_ORDER_STATE_FLOW,
   WORK_ORDER_STATE_LABEL,
+  WORK_ORDER_ROLLBACK_LABEL,
   buildWorkOrderCode,
+  isRollback,
+  type WorkOrderState,
   type WorkOrderView,
 } from '../types/workOrder';
 import { FAULT_SEVERITY_LABEL, type FaultSeverity } from '../types/fault';
@@ -410,7 +413,16 @@ export default function WorkOrderPlan() {
                     </Stack>
                     {WORK_ORDER_STATE_FLOW[order.state].length > 0 ? (
                       <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>
-                        下一步可推进为：{WORK_ORDER_STATE_FLOW[order.state].map((item) => WORK_ORDER_STATE_LABEL[item]).join('、')}
+                        {WORK_ORDER_STATE_FLOW[order.state]
+                          .map((item) => {
+                            const s = item as WorkOrderState;
+                            if (isRollback(order.state, s)) {
+                              return WORK_ORDER_ROLLBACK_LABEL[order.state]?.[s] ?? `退回${WORK_ORDER_STATE_LABEL[s]}`;
+                            }
+                            return `可推进为${WORK_ORDER_STATE_LABEL[s]}`;
+                          })
+                          .join('；')}
+                        （回退操作在「作业进度」页执行，仅撤销本单带出的销号）
                       </Typography>
                     ) : null}
                   </Paper>

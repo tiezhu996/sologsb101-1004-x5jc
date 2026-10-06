@@ -53,7 +53,7 @@ docker compose up -d --build # 代码改动后重建
 | `/inspections` | 巡检与病害录入 | 按巡检批次录入病害并定位到部件 |
 | `/faults` | 病害评定与销号 | 评定等级、批量调整、手工销号与撤销 |
 | `/workorders` | 天窗作业单编排 | 勾选病害成单、分配时间窗与人员机具并校验冲突 |
-| `/progress` | 作业进度与销号回写 | 更新状态，完成项自动回写病害销号 |
+| `/progress` | 作业进度与销号回写 | 更新状态，完成项自动回写病害销号；返工回退按销号来源只撤销本单销号 |
 | `/backup` | 封锁条件与版本 | 登记慢行 / 封锁条件，结构版本与 JSON 管理 |
 
 > 路由使用 `createBrowserRouter`（History 模式），真实路径 `/yards`、`/workorders` 等可直接访问，
@@ -93,7 +93,11 @@ sologsb101-1004/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbrailswitch`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2、v2 → v3 的 `upgrade` 迁移。
+  v2 迁移补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表；
+  v3 新增**销号记录表 `closures`**（销号来源留痕：作业单回写 / 手工销号，撤销时置 `revoked` 不物理删除），
+  病害补 `solvedByWorkOrderId`、作业单补 `solvedFaultIds`，并按「已完成单关联已销号病害」回填 `inferred=true` 的推断来源
+  （推断记录不参与回退自动撤销，回退时改为列入人工核对）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -103,6 +107,7 @@ sologsb101-1004/
   | `inspections` | 巡检 | id / switchId / date / inspector / [switchId+date] |
   | `faults` | 病害 | id / inspectionId / part / severity / state / [inspectionId+part] |
   | `workOrders` | 天窗作业单 | id / code / state / windowStart / leader |
+  | `closures` | 销号记录 | id / faultId / workOrderId / revoked / [faultId+revoked] |
   | `restrictions` | 封锁 / 慢行条件 | id / yardId / switchCode |
   | `settings` | 自定义字典 | id |
 

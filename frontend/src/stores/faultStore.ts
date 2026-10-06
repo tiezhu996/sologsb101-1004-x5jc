@@ -5,16 +5,19 @@
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import {
   ROW_REVISION,
+  listClosures,
   listFaults,
   listInspections,
   listSwitches,
   listYards,
   listWorkOrders,
+  putClosures,
   putFault,
   putFaults,
   putInspection,
   removeFault,
   removeInspection,
+  type ClosureRow,
   type FaultRow,
   type InspectionRow,
   type SwitchRow,
@@ -26,10 +29,12 @@ import type { InspectionDraft, InspectionView } from '../types/inspection';
 import { escalate } from '../utils/severity';
 import { emitChange } from '../utils/events';
 import { nowIso, uuid } from '../utils/format';
+import { nowDateTime } from '../utils/window';
 
 export interface FaultStateSlice {
   inspections: InspectionRow[];
   faults: FaultRow[];
+  closures: ClosureRow[];
   switches: SwitchRow[];
   yards: YardRow[];
   workOrders: WorkOrderRow[];
@@ -45,6 +50,7 @@ export interface FaultStateSlice {
 const initialState: FaultStateSlice = {
   inspections: [],
   faults: [],
+  closures: [],
   switches: [],
   yards: [],
   workOrders: [],
@@ -60,6 +66,7 @@ export const loadFaultData = createAsyncThunk<
   {
     inspections: InspectionRow[];
     faults: FaultRow[];
+    closures: ClosureRow[];
     switches: SwitchRow[];
     yards: YardRow[];
     workOrders: WorkOrderRow[];
@@ -68,14 +75,15 @@ export const loadFaultData = createAsyncThunk<
   { rejectValue: string }
 >('fault/load', async (_arg, { rejectWithValue }) => {
   try {
-    const [inspections, faults, switches, yards, workOrders] = await Promise.all([
+    const [inspections, faults, closures, switches, yards, workOrders] = await Promise.all([
       listInspections(),
       listFaults(),
+      listClosures(),
       listSwitches(),
       listYards(),
       listWorkOrders(),
     ]);
-    return { inspections, faults, switches, yards, workOrders };
+    return { inspections, faults, closures, switches, yards, workOrders };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '病害数据读取失败');
   }
@@ -109,6 +117,7 @@ export const createInspection = createAsyncThunk<
           sizeMm: draft.sizeMm,
           state: 'pending' as const,
           solvedAt: null,
+          solvedByWorkOrderId: null,
           createdAt: nowIso(),
           revision: ROW_REVISION,
         })),
@@ -169,6 +178,7 @@ export const createFault = createAsyncThunk<void, FaultDraft, { rejectValue: str
         sizeMm: draft.sizeMm,
         state: 'pending',
         solvedAt: null,
+        solvedByWorkOrderId: null,
         createdAt: nowIso(),
         revision: ROW_REVISION,
       });
@@ -237,7 +247,12 @@ export const bulkEscalate = createAsyncThunk<number, string[], { rejectValue: st
   },
 );
 
-/** 手工销号 / 撤销销号 */
+/**
+ * 手工销号 / 撤销销号。
+ * 手工销号：病害已有有效销号记录（作业单回写等）时不再追加，避免重复来源；
+ * 否则写入一条 manual 记录。手工撤销是人工明确操作，会把该病害当前所有有效记录
+ * （含作业单回写）一并置为 revoked——与作业单回退的保守策略不同。
+ */
 export const setFaultState = createAsyncThunk<
   void,
   { faultId: string; state: FaultState },
@@ -247,11 +262,44 @@ export const setFaultState = createAsyncThunk<
     const slice = (getState() as { fault: FaultStateSlice }).fault;
     const existing = slice.faults.find((item) => item.id === faultId);
     if (!existing) return;
-    await putFault({
-      ...existing,
-      state,
-      solvedAt: state === 'solved' ? nowIso() : null,
-    });
+    const timestamp = nowDateTime();
+    if (state === 'solved') {
+      await putFault({
+        ...existing,
+        state,
+        solvedAt: existing.solvedAt ?? timestamp,
+        solvedByWorkOrderId: existing.solvedByWorkOrderId ?? null,
+      });
+      const hasActive = slice.closures.some((item) => item.faultId === faultId && !item.revoked);
+      if (!hasActive) {
+        await putClosures([
+          {
+            id: `closure-manual-${faultId}-${uuid()}`,
+            faultId,
+            source: 'manual',
+            workOrderId: null,
+            workOrderCode: null,
+            solvedAt: existing.solvedAt ?? timestamp,
+            revoked: false,
+            revokedAt: null,
+            inferred: false,
+            createdAt: timestamp,
+            revision: ROW_REVISION,
+          },
+        ]);
+      }
+    } else {
+      await putFault({
+        ...existing,
+        state,
+        solvedAt: null,
+        solvedByWorkOrderId: null,
+      });
+      const closureUpdates = slice.closures
+        .filter((item) => item.faultId === faultId && !item.revoked)
+        .map((item) => ({ ...item, revoked: true as const, revokedAt: timestamp }));
+      if (closureUpdates.length > 0) await putClosures(closureUpdates);
+    }
     emitChange();
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '更新销号状态失败');
@@ -297,6 +345,7 @@ const faultSlice = createSlice({
         state.loading = false;
         state.inspections = action.payload.inspections;
         state.faults = action.payload.faults;
+        state.closures = action.payload.closures;
         state.switches = action.payload.switches;
         state.yards = action.payload.yards;
         state.workOrders = action.payload.workOrders;
@@ -323,12 +372,18 @@ interface RootLike {
 
 /** 病害视图：带巡检 / 道岔 / 站场上下文与作业单编排状态 */
 export function selectFaultViews(state: RootLike): FaultView[] {
-  const { faults, inspections, switches, yards, workOrders } = state.fault;
+  const { faults, inspections, switches, yards, workOrders, closures } = state.fault;
   return faults.map((fault) => {
     const inspection = inspections.find((item) => item.id === fault.inspectionId);
     const target = inspection ? switches.find((item) => item.id === inspection.switchId) : undefined;
     const yard = target ? yards.find((item) => item.id === target.yardId) : undefined;
     const relatedOrders = workOrders.filter((order) => order.faultIds.includes(fault.id));
+    const sourceOrder = fault.solvedByWorkOrderId
+      ? workOrders.find((order) => order.id === fault.solvedByWorkOrderId)
+      : undefined;
+    const activeClosure = closures
+      .filter((item) => item.faultId === fault.id && !item.revoked)
+      .sort((a, b) => a.solvedAt.localeCompare(b.solvedAt))[0];
     return {
       ...fault,
       switchId: target?.id ?? '',
@@ -339,6 +394,8 @@ export function selectFaultViews(state: RootLike): FaultView[] {
       inspector: inspection?.inspector ?? '-',
       planned: relatedOrders.length > 0,
       workOrderCodes: relatedOrders.map((order) => order.code),
+      solvedByWorkOrderCode: sourceOrder?.code ?? null,
+      closureInferred: Boolean(activeClosure?.inferred),
     };
   });
 }

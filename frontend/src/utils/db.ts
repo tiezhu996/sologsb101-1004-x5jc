@@ -11,6 +11,7 @@ import type { Switch } from '../types/switch';
 import type { Inspection } from '../types/inspection';
 import type { Fault } from '../types/fault';
 import type { WorkOrder } from '../types/workOrder';
+import type { Closure } from '../types/closure';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { nowDateTime, shiftDate, todayDate, windowMinutes } from './window';
 import { nowIso, uuid } from './format';
@@ -19,7 +20,7 @@ import { nowIso, uuid } from './format';
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -45,6 +46,7 @@ export type SwitchRow = Switch;
 export type InspectionRow = Inspection;
 export type FaultRow = Fault;
 export type WorkOrderRow = WorkOrder;
+export type ClosureRow = Closure;
 export type SpeedRestrictionRow = SpeedRestriction;
 
 class RailSwitchDatabase extends Dexie {
@@ -53,6 +55,8 @@ class RailSwitchDatabase extends Dexie {
   inspections!: Table<InspectionRow, string>;
   faults!: Table<FaultRow, string>;
   workOrders!: Table<WorkOrderRow, string>;
+  /** 销号来源留痕：作业单回写 / 手工销号各一条 */
+  closures!: Table<ClosureRow, string>;
   restrictions!: Table<SpeedRestrictionRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
 
@@ -70,7 +74,7 @@ class RailSwitchDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；道岔补充轨型索引，病害补充组合索引便于按巡检批量操作，
     //     作业单补充负责人索引，并新增封锁条件表
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         yards: 'id, name, region, mileage',
         switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
@@ -112,6 +116,65 @@ class RailSwitchDatabase extends Dexie {
           if (!Array.isArray(row.members)) row.members = [];
           if (!Array.isArray(row.machines)) row.machines = [];
         });
+      });
+
+    // v3：新增销号记录表 closures；病害补 solvedByWorkOrderId，作业单补 solvedFaultIds。
+    //     旧库按「已完成作业单 + 关联病害已销号」尽力回填推断来源（inferred=true），
+    //     推断记录不参与回退自动撤销，只在回退时列出待人工核对。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        yards: 'id, name, region, mileage',
+        switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
+        inspections: 'id, switchId, date, inspector, [switchId+date]',
+        faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
+        workOrders: 'id, code, state, windowStart, leader',
+        closures: 'id, faultId, workOrderId, revoked, [faultId+revoked]',
+        restrictions: 'id, yardId, switchCode',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        const faultTable = tx.table<FaultRow, string>('faults');
+        const orderTable = tx.table<WorkOrderRow, string>('workOrders');
+        const closureTable = tx.table<ClosureRow, string>('closures');
+
+        await faultTable.toCollection().modify((row) => {
+          if (row.solvedByWorkOrderId === undefined) row.solvedByWorkOrderId = null;
+          row.revision = ROW_REVISION;
+        });
+        await orderTable.toCollection().modify((row) => {
+          if (!Array.isArray(row.solvedFaultIds)) row.solvedFaultIds = [];
+          row.revision = ROW_REVISION;
+        });
+
+        // 已完成单按最早完成排序（旧库没有完成时间，以天窗开始时间 + 编号兜底），
+        // 同一病害关联多张已完成单时，最早的一张认定为推断销号来源。
+        const doneOrders = (await orderTable.where('state').equals('done').toArray()).sort((a, b) => {
+          const byWindow = a.windowStart.localeCompare(b.windowStart);
+          return byWindow !== 0 ? byWindow : a.code.localeCompare(b.code);
+        });
+        const solvedFaults = (await faultTable.toArray()).filter((item) => item.state === 'solved');
+        const inferred: ClosureRow[] = [];
+        for (const order of doneOrders) {
+          for (const fault of solvedFaults) {
+            if (!order.faultIds.includes(fault.id)) continue;
+            // 已被更早的完成单认领，则后来的单只推断为关联、不记录来源
+            if (inferred.some((item) => item.faultId === fault.id)) continue;
+            inferred.push({
+              id: `closure-inferred-${order.id}-${fault.id}`,
+              faultId: fault.id,
+              source: 'workOrder',
+              workOrderId: order.id,
+              workOrderCode: order.code,
+              solvedAt: fault.solvedAt ?? order.updatedAt ?? nowIso(),
+              revoked: false,
+              revokedAt: null,
+              inferred: true,
+              createdAt: nowIso(),
+              revision: ROW_REVISION,
+            });
+          }
+        }
+        if (inferred.length > 0) await closureTable.bulkAdd(inferred);
       });
   }
 }
@@ -189,6 +252,7 @@ async function seedDatabase(): Promise<void> {
   const inspections: InspectionRow[] = [];
   const faults: FaultRow[] = [];
   const workOrders: WorkOrderRow[] = [];
+  const closures: ClosureRow[] = [];
   const restrictions: SpeedRestrictionRow[] = [];
 
   SEED_YARDS.forEach((yardSpec, yardIndex) => {
@@ -249,6 +313,7 @@ async function seedDatabase(): Promise<void> {
               ? null
               : Number((1 + random() * 9).toFixed(1));
           const solved = severity === 'light' && random() > 0.5;
+          const solvedAtText = `${shiftDate(offsetDays + 2)} 15:30`;
           faults.push({
             id: `fault-${inspectionId}-${faultIndex + 1}`,
             inspectionId,
@@ -257,10 +322,27 @@ async function seedDatabase(): Promise<void> {
             severity,
             sizeMm,
             state: solved ? 'solved' : 'pending',
-            solvedAt: solved ? `${shiftDate(offsetDays + 2)} 15:30` : null,
+            solvedAt: solved ? solvedAtText : null,
+            solvedByWorkOrderId: null,
             createdAt: stamp,
             revision: ROW_REVISION,
           });
+          if (solved) {
+            // 播种时已销号的病害视为旧的手工销号：回退任何作业单都不应撤销它们
+            closures.push({
+              id: `closure-seed-fault-${inspectionId}-${faultIndex + 1}`,
+              faultId: `fault-${inspectionId}-${faultIndex + 1}`,
+              source: 'manual',
+              workOrderId: null,
+              workOrderCode: null,
+              solvedAt: solvedAtText,
+              revoked: false,
+              revokedAt: null,
+              inferred: false,
+              createdAt: stamp,
+              revision: ROW_REVISION,
+            });
+          }
         }
       }
     });
@@ -305,6 +387,7 @@ async function seedDatabase(): Promise<void> {
       machines: index === 0 ? ['轨距尺', '钢轨打磨机', '扭矩扳手'] : ['道尺', '捣固镐'],
       members: index === 0 ? ['赵铁军', '孙立波'] : index === 1 ? ['孙立波', '郑小勇'] : ['周振海', '冯国栋'],
       state: group.state,
+      solvedFaultIds: [],
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -336,13 +419,14 @@ async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.closures, db.restrictions],
     async () => {
       await db.yards.bulkPut(yards);
       await db.switches.bulkPut(switches);
       await db.inspections.bulkPut(inspections);
       await db.faults.bulkPut(faults);
       await db.workOrders.bulkPut(workOrders);
+      await db.closures.bulkPut(closures);
       await db.restrictions.bulkPut(restrictions);
     },
   );
@@ -513,6 +597,20 @@ export async function removeWorkOrder(id: string): Promise<void> {
   await db.workOrders.delete(id);
 }
 
+/* ============================ 销号记录 ============================ */
+
+export async function listClosures(): Promise<ClosureRow[]> {
+  return db.closures.toArray();
+}
+
+export async function putClosure(row: ClosureRow): Promise<void> {
+  await db.closures.put(row);
+}
+
+export async function putClosures(rows: ClosureRow[]): Promise<void> {
+  await db.closures.bulkPut(rows);
+}
+
 /* =========================== 封锁 / 慢行条件 =========================== */
 
 export async function listRestrictions(): Promise<SpeedRestrictionRow[]> {
@@ -539,16 +637,18 @@ export interface DatabaseSnapshot {
   inspections: Inspection[];
   faults: Fault[];
   workOrders: WorkOrder[];
+  closures: Closure[];
   restrictions: SpeedRestriction[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
+  const [yards, switches, inspections, faults, workOrders, closures, restrictions] = await Promise.all([
     listYards(),
     listSwitches(),
     listInspections(),
     listFaults(),
     listWorkOrders(),
+    listClosures(),
     listRestrictions(),
   ]);
   return {
@@ -560,6 +660,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     inspections,
     faults,
     workOrders,
+    closures,
     restrictions,
   };
 }
@@ -567,7 +668,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.closures, db.restrictions],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -575,6 +676,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.inspections.clear(),
         db.faults.clear(),
         db.workOrders.clear(),
+        db.closures.clear(),
         db.restrictions.clear(),
       ]);
       await db.yards.bulkPut(snapshot.yards ?? []);
@@ -582,6 +684,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.inspections.bulkPut(snapshot.inspections ?? []);
       await db.faults.bulkPut(snapshot.faults ?? []);
       await db.workOrders.bulkPut(snapshot.workOrders ?? []);
+      await db.closures.bulkPut(snapshot.closures ?? []);
       await db.restrictions.bulkPut(snapshot.restrictions ?? []);
     },
   );
@@ -591,7 +694,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.closures, db.restrictions],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -599,6 +702,7 @@ export async function resetDatabase(): Promise<void> {
         db.inspections.clear(),
         db.faults.clear(),
         db.workOrders.clear(),
+        db.closures.clear(),
         db.restrictions.clear(),
       ]);
     },
@@ -608,15 +712,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
+  const [yards, switches, inspections, faults, workOrders, closures, restrictions] = await Promise.all([
     db.yards.count(),
     db.switches.count(),
     db.inspections.count(),
     db.faults.count(),
     db.workOrders.count(),
+    db.closures.count(),
     db.restrictions.count(),
   ]);
-  return { yards, switches, inspections, faults, workOrders, restrictions };
+  return { yards, switches, inspections, faults, workOrders, closures, restrictions };
 }
 
 /** 结构版本信息 */
