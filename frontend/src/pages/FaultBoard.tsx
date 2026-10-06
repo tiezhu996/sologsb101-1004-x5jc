@@ -37,7 +37,16 @@ import TrendingUpIcon from '@mui/icons-material/TrendingUp';
 import DownloadIcon from '@mui/icons-material/Download';
 import { useAppDispatch, useAppSelector } from '../hooks/useAppStore';
 import { useFaultFilter } from '../hooks/useFaultFilter';
-import { bulkEscalate, bulkSetSeverity, createFault, deleteFault, setFaultState, updateFault } from '../stores/faultStore';
+import {
+  bulkEscalate,
+  bulkSetSeverity,
+  createFault,
+  deleteFault,
+  forceUnsolveFault,
+  selectLegacySolvedFaults,
+  setFaultState,
+  updateFault,
+} from '../stores/faultStore';
 import { selectSwitchViews } from '../stores/yardStore';
 import { selectInspectionViews } from '../stores/faultStore';
 import {
@@ -56,6 +65,7 @@ import { ROUTES } from '../router/routes';
 import { countBySeverity, formatSizeMm, sizeSeverityHint } from '../utils/severity';
 import { downloadCsv, share } from '../utils/format';
 import { nowDateTime } from '../utils/window';
+import { SOLVE_SOURCE_LABEL } from '../types/solveRecord';
 import SeverityTag from '../components/common/SeverityTag';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
@@ -67,12 +77,19 @@ export default function FaultBoard() {
   const filter = useFaultFilter();
   const switches = useAppSelector(selectSwitchViews);
   const inspections = useAppSelector(selectInspectionViews);
+  const legacySolvedFaults = useAppSelector(selectLegacySolvedFaults);
 
   const keyword = useKeywordFilter();
   const urlFilters = useFilterValues(['yard', 'part', 'severity', 'state']);
   const [selected, setSelected] = useState<string[]>([]);
   const [toast, setToast] = useState('');
   const [bulkSeverity, setBulkSeverity] = useState<FaultSeverity>('medium');
+  /** 待人工核对的无来源销号：确认强制撤销 */
+  const [legacyConfirm, setLegacyConfirm] = useState<{ open: boolean; ids: string[]; label: string }>({
+    open: false,
+    ids: [],
+    label: '',
+  });
   const [editDialog, setEditDialog] = useState<{
     open: boolean;
     editingId: string | null;
@@ -151,7 +168,7 @@ export default function FaultBoard() {
   };
 
   const exportCsv = (): void => {
-    const header = ['站场', '道岔', '巡检日期', '部件', '类型', '等级', '尺寸(mm)', '状态', '销号时间', '作业单'];
+    const header = ['站场', '道岔', '巡检日期', '部件', '类型', '等级', '尺寸(mm)', '状态', '销号时间', '销号来源', '作业单'];
     const body = rows.map((row) => [
       row.yardName,
       row.switchCode,
@@ -162,6 +179,13 @@ export default function FaultBoard() {
       row.sizeMm ?? '',
       row.state === 'solved' ? '已销号' : '待修',
       row.solvedAt ?? '',
+      row.state === 'solved'
+        ? row.solveSource
+          ? row.solveSource === 'workOrder' && row.solveWorkOrderCode
+            ? `${SOLVE_SOURCE_LABEL.workOrder} ${row.solveWorkOrderCode}`
+            : SOLVE_SOURCE_LABEL[row.solveSource]
+          : '无来源记录·待核对'
+        : '',
       row.workOrderCodes.join(' '),
     ]);
     downloadCsv(`gbrailswitch-faults-${nowDateTime().slice(0, 10)}.csv`, [header, ...body]);
@@ -310,10 +334,16 @@ export default function FaultBoard() {
             startIcon={<DoneAllIcon />}
             disabled={selected.length === 0}
             onClick={async () => {
+              let solved = 0;
+              let kept = 0;
               for (const faultId of selected) {
-                await dispatch(setFaultState({ faultId, state: 'solved' }));
+                const result = await dispatch(setFaultState({ faultId, state: 'solved' })).unwrap();
+                if (result.outcome === 'solve') solved += 1;
+                else if (result.outcome === 'kept') kept += 1;
               }
-              setToast(`已手工销号 ${selected.length} 处病害`);
+              setToast(
+                `已手工销号 ${solved} 处病害` + (kept > 0 ? `；${kept} 处原本已销号（作业单或此前手工），保持原来源` : ''),
+              );
               setSelected([]);
             }}
           >
@@ -326,10 +356,19 @@ export default function FaultBoard() {
             startIcon={<UndoIcon />}
             disabled={selected.length === 0}
             onClick={async () => {
+              let reverted = 0;
+              const blocked: string[] = [];
               for (const faultId of selected) {
-                await dispatch(setFaultState({ faultId, state: 'pending' }));
+                const result = await dispatch(setFaultState({ faultId, state: 'pending' })).unwrap();
+                if (result.outcome === 'unsolve') reverted += 1;
+                else if (result.outcome === 'legacyBlocked') blocked.push(faultId);
               }
-              setToast(`已撤销销号 ${selected.length} 处病害`);
+              if (blocked.length > 0) {
+                setLegacyConfirm({ open: true, ids: blocked, label: `选中的 ${blocked.length} 处无来源记录病害` });
+                setToast(`已撤销 ${reverted} 处；${blocked.length} 处无来源记录，需人工核对后强制撤销`);
+              } else {
+                setToast(`已撤销销号 ${reverted} 处病害`);
+              }
               setSelected([]);
             }}
           >
@@ -418,6 +457,15 @@ export default function FaultBoard() {
                           {row.solvedAt}
                         </Typography>
                       ) : null}
+                      {row.state === 'solved' ? (
+                        <Typography variant="caption" display="block" color="text.secondary">
+                          {row.solveSource
+                            ? row.solveSource === 'workOrder' && row.solveWorkOrderCode
+                              ? `${SOLVE_SOURCE_LABEL.workOrder} · ${row.solveWorkOrderCode}`
+                              : SOLVE_SOURCE_LABEL[row.solveSource]
+                            : '无来源记录·待核对'}
+                        </Typography>
+                      ) : null}
                     </TableCell>
                     <TableCell>
                       {row.planned ? (
@@ -451,10 +499,22 @@ export default function FaultBoard() {
                         size="small"
                         color={row.state === 'solved' ? 'warning' : 'success'}
                         onClick={async () => {
-                          await dispatch(
-                            setFaultState({ faultId: row.id, state: row.state === 'solved' ? 'pending' : 'solved' }),
-                          );
-                          setToast(row.state === 'solved' ? '已撤销销号' : '已手工销号');
+                          if (row.state === 'solved') {
+                            const result = await dispatch(setFaultState({ faultId: row.id, state: 'pending' })).unwrap();
+                            if (result.outcome === 'legacyBlocked') {
+                              setLegacyConfirm({ open: true, ids: [row.id], label: `${row.yardName} ${row.switchCode} ${FAULT_PART_LABEL[row.part]}` });
+                              setToast('该病害无销号来源记录（旧单数据），需人工核对后强制撤销');
+                            } else {
+                              setToast('已撤销销号');
+                            }
+                          } else {
+                            const result = await dispatch(setFaultState({ faultId: row.id, state: 'solved' })).unwrap();
+                            setToast(
+                              result.outcome === 'kept'
+                                ? '该病害已处于已销号状态，保持原销号来源'
+                                : '已手工销号',
+                            );
+                          }
                         }}
                       >
                         {row.state === 'solved' ? '撤销' : '销号'}
@@ -567,6 +627,100 @@ export default function FaultBoard() {
           <Button onClick={() => setEditDialog((prev) => ({ ...prev, open: false }))}>取消</Button>
           <Button variant="contained" onClick={() => void submitFault()}>
             保存
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {legacySolvedFaults.length > 0 ? (
+        <Paper variant="outlined" sx={{ borderRadius: 2, p: 1.5, mt: 1.75, borderColor: 'warning.light' }}>
+          <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" useFlexGap mb={1}>
+            <Typography variant="subtitle1" fontWeight={600} color="warning.dark">
+              无销号来源记录 · 待人工核对（{legacySolvedFaults.length} 处）
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              多为旧单 / 旧版数据；作业单回退不会撤销这些销号，核对确认后可在此强制撤销
+            </Typography>
+          </Stack>
+          <TableContainer>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>站场 / 道岔</TableCell>
+                  <TableCell>巡检日期</TableCell>
+                  <TableCell>部件 / 类型</TableCell>
+                  <TableCell>销号时间</TableCell>
+                  <TableCell>关联作业单</TableCell>
+                  <TableCell align="right">操作</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {legacySolvedFaults.map((row) => (
+                  <TableRow key={row.id} hover>
+                    <TableCell>
+                      {row.yardName} · {row.switchCode}
+                    </TableCell>
+                    <TableCell>{row.inspectionDate}</TableCell>
+                    <TableCell>
+                      {FAULT_PART_LABEL[row.part]} / {FAULT_TYPE_LABEL[row.type]}
+                    </TableCell>
+                    <TableCell>{row.solvedAt ?? '—'}</TableCell>
+                    <TableCell>{row.workOrderCodes.length > 0 ? row.workOrderCodes.join('、') : '未编排'}</TableCell>
+                    <TableCell align="right">
+                      <Button
+                        size="small"
+                        color="warning"
+                        startIcon={<UndoIcon />}
+                        onClick={() =>
+                          setLegacyConfirm({
+                            open: true,
+                            ids: [row.id],
+                            label: `${row.yardName} ${row.switchCode} ${FAULT_PART_LABEL[row.part]}`,
+                          })
+                        }
+                      >
+                        核对后强制撤销
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </Paper>
+      ) : null}
+
+      <Dialog
+        open={legacyConfirm.open}
+        onClose={() => setLegacyConfirm((prev) => ({ ...prev, open: false }))}
+        fullWidth
+        maxWidth="xs"
+      >
+        <DialogTitle>人工核对确认</DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2" paragraph>
+            {legacyConfirm.label} 的销号缺少来源记录，无法判断是手工销号还是旧作业单带出。
+          </Typography>
+          <Typography variant="body2" color="warning.dark">
+            确认这 {legacyConfirm.ids.length} 处病害确属误销 / 返工范围后，再强制撤销回「待修」；否则请保留并线下核对。
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setLegacyConfirm((prev) => ({ ...prev, open: false }))}>保留销号</Button>
+          <Button
+            variant="contained"
+            color="warning"
+            onClick={async () => {
+              const ids = legacyConfirm.ids;
+              let count = 0;
+              for (const faultId of ids) {
+                const result = await dispatch(forceUnsolveFault(faultId)).unwrap();
+                if (result.reverted) count += 1;
+              }
+              setLegacyConfirm((prev) => ({ ...prev, open: false }));
+              setToast(`经人工核对，已强制撤销 ${count} 处病害销号`);
+            }}
+          >
+            核对无误，强制撤销
           </Button>
         </DialogActions>
       </Dialog>

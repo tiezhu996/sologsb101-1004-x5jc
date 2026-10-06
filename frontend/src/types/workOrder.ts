@@ -18,6 +18,19 @@ export const WORK_ORDER_STATE_FLOW: Record<WorkOrderState, WorkOrderState[]> = {
   done: [],
 };
 
+/**
+ * 作业单回退流（单点错完成 / 班组返工）：
+ * - 已完成 → 作业中
+ * - 已下达 → 待编排
+ * 作业中不允许直接退回已下达；回退时按销号来源记录只撤销本单带出的销号。
+ */
+export const WORK_ORDER_ROLLBACK_FLOW: Record<WorkOrderState, WorkOrderState[]> = {
+  planned: [],
+  issued: ['planned'],
+  working: [],
+  done: ['working'],
+};
+
 /** 天窗作业单 */
 export interface WorkOrder extends Revisioned {
   id: string;
@@ -70,6 +83,10 @@ export interface WorkOrderView extends WorkOrder {
   machineConflict: boolean;
   /** 关联病害中仍未销号的数量 */
   pendingFaultCount: number;
+  /** 本单实际带出销号的病害数量（销号来源记录归属本单） */
+  solvedByOrderCount: number;
+  /** 已销号但无来源记录、回退时需人工核对的关联病害数量（旧单数据） */
+  unattributedSolvedCount: number;
 }
 
 /** 常用机具字典 */

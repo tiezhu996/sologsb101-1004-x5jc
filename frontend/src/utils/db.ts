@@ -11,6 +11,7 @@ import type { Switch } from '../types/switch';
 import type { Inspection } from '../types/inspection';
 import type { Fault } from '../types/fault';
 import type { WorkOrder } from '../types/workOrder';
+import type { SolveRecord } from '../types/solveRecord';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { nowDateTime, shiftDate, todayDate, windowMinutes } from './window';
 import { nowIso, uuid } from './format';
@@ -19,7 +20,7 @@ import { nowIso, uuid } from './format';
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -46,6 +47,7 @@ export type InspectionRow = Inspection;
 export type FaultRow = Fault;
 export type WorkOrderRow = WorkOrder;
 export type SpeedRestrictionRow = SpeedRestriction;
+export type SolveRecordRow = SolveRecord;
 
 class RailSwitchDatabase extends Dexie {
   yards!: Table<YardRow, string>;
@@ -54,6 +56,8 @@ class RailSwitchDatabase extends Dexie {
   faults!: Table<FaultRow, string>;
   workOrders!: Table<WorkOrderRow, string>;
   restrictions!: Table<SpeedRestrictionRow, string>;
+  /** 销号来源记录：一处病害同时至多一条生效记录，faultId 建唯一索引 */
+  solveRecords!: Table<SolveRecordRow, string>;
   settings!: Table<{ id: string; value: string; updatedAt: string }, string>;
 
   constructor() {
@@ -113,6 +117,19 @@ class RailSwitchDatabase extends Dexie {
           if (!Array.isArray(row.machines)) row.machines = [];
         });
       });
+
+    // v3：新增销号记录表，登记每处病害当前销号的来源（手工 / 作业单），
+    //     支撑作业单回退时只撤销本单实际带出的销号；旧数据不回填来源，按旧单人工核对
+    this.version(DB_SCHEMA_VERSION).stores({
+      yards: 'id, name, region, mileage',
+      switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
+      inspections: 'id, switchId, date, inspector, [switchId+date]',
+      faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
+      workOrders: 'id, code, state, windowStart, leader',
+      restrictions: 'id, yardId, switchCode',
+      solveRecords: 'id, faultId, source, workOrderId',
+      settings: 'id',
+    });
   }
 }
 
@@ -190,6 +207,7 @@ async function seedDatabase(): Promise<void> {
   const faults: FaultRow[] = [];
   const workOrders: WorkOrderRow[] = [];
   const restrictions: SpeedRestrictionRow[] = [];
+  const solveRecords: SolveRecordRow[] = [];
 
   SEED_YARDS.forEach((yardSpec, yardIndex) => {
     const yardId = `yard-${yardIndex + 1}`;
@@ -249,18 +267,33 @@ async function seedDatabase(): Promise<void> {
               ? null
               : Number((1 + random() * 9).toFixed(1));
           const solved = severity === 'light' && random() > 0.5;
+          const solvedAt = solved ? `${shiftDate(offsetDays + 2)} 15:30` : null;
+          const faultId = `fault-${inspectionId}-${faultIndex + 1}`;
           faults.push({
-            id: `fault-${inspectionId}-${faultIndex + 1}`,
+            id: faultId,
             inspectionId,
             part,
             type,
             severity,
             sizeMm,
             state: solved ? 'solved' : 'pending',
-            solvedAt: solved ? `${shiftDate(offsetDays + 2)} 15:30` : null,
+            solvedAt,
             createdAt: stamp,
             revision: ROW_REVISION,
           });
+          // 演示数据中的历史已销号病害统一登记为手工销号来源
+          if (solved && solvedAt) {
+            solveRecords.push({
+              id: `solve-${faultId}`,
+              faultId,
+              source: 'manual',
+              workOrderId: null,
+              workOrderCode: null,
+              solvedAt,
+              createdAt: stamp,
+              revision: ROW_REVISION,
+            });
+          }
         }
       }
     });
@@ -336,7 +369,7 @@ async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions, db.solveRecords],
     async () => {
       await db.yards.bulkPut(yards);
       await db.switches.bulkPut(switches);
@@ -344,6 +377,7 @@ async function seedDatabase(): Promise<void> {
       await db.faults.bulkPut(faults);
       await db.workOrders.bulkPut(workOrders);
       await db.restrictions.bulkPut(restrictions);
+      await db.solveRecords.bulkPut(solveRecords);
     },
   );
 }
@@ -374,7 +408,7 @@ export async function putYard(row: YardRow): Promise<void> {
 export async function removeYard(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions, db.solveRecords],
     async () => {
       const switchRows = await db.switches.where('yardId').equals(id).toArray();
       const switchIds = switchRows.map((item) => item.id);
@@ -395,6 +429,7 @@ export async function removeYard(id: string): Promise<void> {
             else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
           }
         }
+        await db.solveRecords.where('faultId').anyOf([...faultIds]).delete();
       }
       if (inspectionIds.length) await db.faults.where('inspectionId').anyOf(inspectionIds).delete();
       if (switchIds.length) await db.inspections.where('switchId').anyOf(switchIds).delete();
@@ -421,25 +456,30 @@ export async function putSwitches(rows: SwitchRow[]): Promise<void> {
 }
 
 export async function removeSwitch(id: string): Promise<void> {
-  await db.transaction('rw', [db.switches, db.inspections, db.faults, db.workOrders], async () => {
-    const inspectionRows = await db.inspections.where('switchId').equals(id).toArray();
-    const inspectionIds = inspectionRows.map((item) => item.id);
-    if (inspectionIds.length > 0) {
-      const faultRows = await db.faults.where('inspectionId').anyOf(inspectionIds).toArray();
-      const faultIds = new Set(faultRows.map((item) => item.id));
-      const orders = await db.workOrders.toArray();
-      for (const order of orders) {
-        const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
-        if (remaining.length !== order.faultIds.length) {
-          if (remaining.length === 0) await db.workOrders.delete(order.id);
-          else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+  await db.transaction(
+    'rw',
+    [db.switches, db.inspections, db.faults, db.workOrders, db.solveRecords],
+    async () => {
+      const inspectionRows = await db.inspections.where('switchId').equals(id).toArray();
+      const inspectionIds = inspectionRows.map((item) => item.id);
+      if (inspectionIds.length > 0) {
+        const faultRows = await db.faults.where('inspectionId').anyOf(inspectionIds).toArray();
+        const faultIds = new Set(faultRows.map((item) => item.id));
+        const orders = await db.workOrders.toArray();
+        for (const order of orders) {
+          const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
+          if (remaining.length !== order.faultIds.length) {
+            if (remaining.length === 0) await db.workOrders.delete(order.id);
+            else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+          }
         }
+        if (faultIds.size > 0) await db.solveRecords.where('faultId').anyOf([...faultIds]).delete();
+        await db.faults.where('inspectionId').anyOf(inspectionIds).delete();
+        await db.inspections.where('switchId').equals(id).delete();
       }
-      await db.faults.where('inspectionId').anyOf(inspectionIds).delete();
-      await db.inspections.where('switchId').equals(id).delete();
-    }
-    await db.switches.delete(id);
-  });
+      await db.switches.delete(id);
+    },
+  );
 }
 
 /* ============================== 巡检 ============================== */
@@ -455,20 +495,25 @@ export async function putInspection(row: InspectionRow): Promise<void> {
 
 /** 删除巡检并级联删除病害，同时从作业单中摘除对应病害 */
 export async function removeInspection(id: string): Promise<void> {
-  await db.transaction('rw', [db.inspections, db.faults, db.workOrders], async () => {
-    const faultRows = await db.faults.where('inspectionId').equals(id).toArray();
-    const faultIds = new Set(faultRows.map((item) => item.id));
-    const orders = await db.workOrders.toArray();
-    for (const order of orders) {
-      const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
-      if (remaining.length !== order.faultIds.length) {
-        if (remaining.length === 0) await db.workOrders.delete(order.id);
-        else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+  await db.transaction(
+    'rw',
+    [db.inspections, db.faults, db.workOrders, db.solveRecords],
+    async () => {
+      const faultRows = await db.faults.where('inspectionId').equals(id).toArray();
+      const faultIds = new Set(faultRows.map((item) => item.id));
+      const orders = await db.workOrders.toArray();
+      for (const order of orders) {
+        const remaining = order.faultIds.filter((faultId) => !faultIds.has(faultId));
+        if (remaining.length !== order.faultIds.length) {
+          if (remaining.length === 0) await db.workOrders.delete(order.id);
+          else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
+        }
       }
-    }
-    await db.faults.where('inspectionId').equals(id).delete();
-    await db.inspections.delete(id);
-  });
+      if (faultIds.size > 0) await db.solveRecords.where('faultId').anyOf([...faultIds]).delete();
+      await db.faults.where('inspectionId').equals(id).delete();
+      await db.inspections.delete(id);
+    },
+  );
 }
 
 /* ============================== 病害 ============================== */
@@ -486,7 +531,7 @@ export async function putFaults(rows: FaultRow[]): Promise<void> {
 }
 
 export async function removeFault(id: string): Promise<void> {
-  await db.transaction('rw', [db.faults, db.workOrders], async () => {
+  await db.transaction('rw', [db.faults, db.workOrders, db.solveRecords], async () => {
     const orders = await db.workOrders.toArray();
     for (const order of orders) {
       if (!order.faultIds.includes(id)) continue;
@@ -494,6 +539,7 @@ export async function removeFault(id: string): Promise<void> {
       if (remaining.length === 0) await db.workOrders.delete(order.id);
       else await db.workOrders.put({ ...order, faultIds: remaining, updatedAt: nowIso() });
     }
+    await db.solveRecords.where('faultId').equals(id).delete();
     await db.faults.delete(id);
   });
 }
@@ -510,7 +556,154 @@ export async function putWorkOrder(row: WorkOrderRow): Promise<void> {
 }
 
 export async function removeWorkOrder(id: string): Promise<void> {
+  // 仅删作业单本身：已回写的销号保留来源记录，由病害页人工处理，不在此静默改病害
   await db.workOrders.delete(id);
+}
+
+/* ============================ 销号记录与回退 ============================ */
+
+export async function listSolveRecords(): Promise<SolveRecordRow[]> {
+  return db.solveRecords.toArray();
+}
+
+export async function putSolveRecord(row: SolveRecordRow): Promise<void> {
+  await db.solveRecords.put(row);
+}
+
+/** 组装一条销号记录 id */
+function solveRecordId(faultId: string): string {
+  return `solve-${faultId}`;
+}
+
+/**
+ * 作业单完成回写：只对仍「待修」的关联病害销号，并逐条登记来源为本单；
+ * 同时落库作业单（调用方传入已置为 done 的新行）。整个过程在一个事务内。
+ * 已经销过的（手工或别的单先销过）保持原状，本单不抢来源。
+ */
+export async function completeWorkOrderSolve(order: WorkOrderRow): Promise<{ solvedFaultIds: string[] }> {
+  const solvedFaultIds: string[] = [];
+  await db.transaction('rw', [db.workOrders, db.faults, db.solveRecords], async () => {
+    const solvedAt = nowDateTime();
+    const stamp = nowIso();
+    for (const faultId of order.faultIds) {
+      const fault = await db.faults.get(faultId);
+      if (!fault || fault.state === 'solved') continue;
+      await db.faults.put({ ...fault, state: 'solved' as const, solvedAt });
+      // 防御：若无来源记录（理论上不发生），补一条登记给本单
+      const existed = await db.solveRecords.get(solveRecordId(faultId));
+      if (existed) continue;
+      await db.solveRecords.put({
+        id: solveRecordId(faultId),
+        faultId,
+        source: 'workOrder',
+        workOrderId: order.id,
+        workOrderCode: order.code,
+        solvedAt,
+        createdAt: stamp,
+        revision: ROW_REVISION,
+      });
+      solvedFaultIds.push(faultId);
+    }
+    await db.workOrders.put(order);
+  });
+  return { solvedFaultIds };
+}
+
+export interface RollbackSolveResult {
+  /** 本单实际带出、已撤销回「待修」的病害 */
+  revertedFaultIds: string[];
+  /** 关联病害中已销号但查不到本单来源记录的（手工销号 / 别的单先销 / 旧单），需人工核对 */
+  unattributedFaultIds: string[];
+}
+
+/**
+ * 作业单回退：只撤销本单实际带出的销号（source 为本单的记录）。
+ * - 手工销过的、别的单先销过的：销号与病害状态保留；
+ * - 同一病害关联多张单时，记录只属于最早完成的单，后来那张回退只改作业单状态、不碰病害；
+ * - 旧单没有来源记录的已销号病害列出来等人工核对，不直接撤销。
+ */
+export async function rollbackWorkOrderSolve(
+  order: WorkOrderRow,
+  nextState: WorkOrderRow['state'],
+): Promise<RollbackSolveResult> {
+  const result: RollbackSolveResult = { revertedFaultIds: [], unattributedFaultIds: [] };
+  await db.transaction('rw', [db.workOrders, db.faults, db.solveRecords], async () => {
+    for (const faultId of order.faultIds) {
+      const fault = await db.faults.get(faultId);
+      if (!fault) continue;
+      const record = await db.solveRecords.get(solveRecordId(faultId));
+      if (record?.source === 'workOrder' && record.workOrderId === order.id) {
+        await db.faults.put({ ...fault, state: 'pending' as const, solvedAt: null });
+        await db.solveRecords.delete(record.id);
+        result.revertedFaultIds.push(faultId);
+      } else if (fault.state === 'solved') {
+        // 已销号但非本单带出：手工 / 别的单 / 无来源旧数据，一律保留并列出核对
+        result.unattributedFaultIds.push(faultId);
+      }
+    }
+    await db.workOrders.put({ ...order, state: nextState, updatedAt: nowDateTime() });
+  });
+  return result;
+}
+
+/**
+ * 手工销号：病害仍为待修时置为已销号并登记来源 manual；
+ * 病害已有销号（含作业单先销）时不重复登记，返回 kept=true 供页面提示。
+ */
+export async function manualSolveFault(
+  fault: FaultRow,
+): Promise<{ solved: boolean; kept: boolean }> {
+  if (fault.state === 'solved') return { solved: false, kept: true };
+  const solvedAt = nowDateTime();
+  await db.transaction('rw', [db.faults, db.solveRecords], async () => {
+    await db.faults.put({ ...fault, state: 'solved' as const, solvedAt });
+    const existed = await db.solveRecords.get(solveRecordId(fault.id));
+    if (!existed) {
+      await db.solveRecords.put({
+        id: solveRecordId(fault.id),
+        faultId: fault.id,
+        source: 'manual',
+        workOrderId: null,
+        workOrderCode: null,
+        solvedAt,
+        createdAt: nowIso(),
+        revision: ROW_REVISION,
+      });
+    }
+  });
+  return { solved: true, kept: false };
+}
+
+/**
+ * 手工撤销销号：有来源记录才回到待修并删记录；
+ * 无来源记录的历史销号数据不自动改动，返回 false 交人工核对。
+ */
+export async function manualUnsolveFault(fault: FaultRow): Promise<{ reverted: boolean }> {
+  if (fault.state !== 'solved') return { reverted: false };
+  const record = await db.solveRecords.get(solveRecordId(fault.id));
+  if (!record) return { reverted: false };
+  await db.transaction('rw', [db.faults, db.solveRecords], async () => {
+    await db.faults.put({ ...fault, state: 'pending' as const, solvedAt: null });
+    await db.solveRecords.delete(record.id);
+  });
+  return { reverted: true };
+}
+
+/**
+ * 人工核对后的强制撤销：仅用于没有来源记录的历史已销号病害（旧单 / 旧版数据）。
+ * 页面必须先把该病害列入待核对清单，由用户显式确认后调用；存在来源记录时不在此处理。
+ */
+export async function forceUnsolveFaultById(faultId: string): Promise<{ reverted: boolean }> {
+  let reverted = false;
+  await db.transaction('rw', [db.faults, db.solveRecords], async () => {
+    const fault = await db.faults.get(faultId);
+    if (!fault || fault.state !== 'solved') return;
+    const record = await db.solveRecords.get(solveRecordId(faultId));
+    if (record) return; // 有来源记录，禁止用强制通道绕过归属
+    await db.faults.put({ ...fault, state: 'pending' as const, solvedAt: null });
+    reverted = true;
+  });
+  return { reverted };
 }
 
 /* =========================== 封锁 / 慢行条件 =========================== */
@@ -540,16 +733,19 @@ export interface DatabaseSnapshot {
   faults: Fault[];
   workOrders: WorkOrder[];
   restrictions: SpeedRestriction[];
+  /** 销号来源记录；旧备份可能没有该字段，导入时按空数组处理 */
+  solveRecords?: SolveRecord[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
+  const [yards, switches, inspections, faults, workOrders, restrictions, solveRecords] = await Promise.all([
     listYards(),
     listSwitches(),
     listInspections(),
     listFaults(),
     listWorkOrders(),
     listRestrictions(),
+    listSolveRecords(),
   ]);
   return {
     name: DB_NAME,
@@ -561,13 +757,22 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     faults,
     workOrders,
     restrictions,
+    solveRecords,
   };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [
+      db.yards,
+      db.switches,
+      db.inspections,
+      db.faults,
+      db.workOrders,
+      db.restrictions,
+      db.solveRecords,
+    ],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -576,6 +781,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.solveRecords.clear(),
       ]);
       await db.yards.bulkPut(snapshot.yards ?? []);
       await db.switches.bulkPut(snapshot.switches ?? []);
@@ -583,6 +789,11 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.faults.bulkPut(snapshot.faults ?? []);
       await db.workOrders.bulkPut(snapshot.workOrders ?? []);
       await db.restrictions.bulkPut(snapshot.restrictions ?? []);
+      // 只保留能对应到现存病害的销号记录，避免脏来源
+      const faultIds = new Set((snapshot.faults ?? []).map((item) => item.id));
+      await db.solveRecords.bulkPut(
+        (snapshot.solveRecords ?? []).filter((item) => faultIds.has(item.faultId)),
+      );
     },
   );
 }
@@ -591,7 +802,15 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.yards, db.switches, db.inspections, db.faults, db.workOrders, db.restrictions],
+    [
+      db.yards,
+      db.switches,
+      db.inspections,
+      db.faults,
+      db.workOrders,
+      db.restrictions,
+      db.solveRecords,
+    ],
     async () => {
       await Promise.all([
         db.yards.clear(),
@@ -600,6 +819,7 @@ export async function resetDatabase(): Promise<void> {
         db.faults.clear(),
         db.workOrders.clear(),
         db.restrictions.clear(),
+        db.solveRecords.clear(),
       ]);
     },
   );
@@ -608,15 +828,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [yards, switches, inspections, faults, workOrders, restrictions] = await Promise.all([
+  const [yards, switches, inspections, faults, workOrders, restrictions, solveRecords] = await Promise.all([
     db.yards.count(),
     db.switches.count(),
     db.inspections.count(),
     db.faults.count(),
     db.workOrders.count(),
     db.restrictions.count(),
+    db.solveRecords.count(),
   ]);
-  return { yards, switches, inspections, faults, workOrders, restrictions };
+  return { yards, switches, inspections, faults, workOrders, restrictions, solveRecords };
 }
 
 /** 结构版本信息 */

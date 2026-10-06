@@ -1,4 +1,5 @@
 import type { Revisioned } from './persistence';
+import type { SolveSource } from './solveRecord';
 
 /** 病害部件 */
 export type FaultPart = 'pointRail' | 'stockRail' | 'frog' | 'machine';
@@ -83,6 +84,10 @@ export interface FaultView extends Fault {
   planned: boolean;
   /** 关联作业单号 */
   workOrderCodes: string[];
+  /** 当前销号来源；无来源记录的历史已销号数据为 null（需人工核对） */
+  solveSource: SolveSource | null;
+  /** 销号来源作业单编号（随作业单销号时有值） */
+  solveWorkOrderCode: string | null;
 }
 
 /** 部件巡检要点 */

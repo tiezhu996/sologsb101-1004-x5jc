@@ -7,9 +7,13 @@ import {
   ROW_REVISION,
   listFaults,
   listInspections,
+  listSolveRecords,
   listSwitches,
   listYards,
   listWorkOrders,
+  forceUnsolveFaultById,
+  manualSolveFault,
+  manualUnsolveFault,
   putFault,
   putFaults,
   putInspection,
@@ -17,6 +21,7 @@ import {
   removeInspection,
   type FaultRow,
   type InspectionRow,
+  type SolveRecordRow,
   type SwitchRow,
   type WorkOrderRow,
   type YardRow,
@@ -33,6 +38,8 @@ export interface FaultStateSlice {
   switches: SwitchRow[];
   yards: YardRow[];
   workOrders: WorkOrderRow[];
+  /** 销号来源记录 */
+  solveRecords: SolveRecordRow[];
   /** 筛选条件（跨页保留，页面只读本 slice） */
   partFilters: FaultPart[];
   severityFilters: FaultSeverity[];
@@ -48,6 +55,7 @@ const initialState: FaultStateSlice = {
   switches: [],
   yards: [],
   workOrders: [],
+  solveRecords: [],
   partFilters: [],
   severityFilters: [],
   stateFilters: [],
@@ -63,19 +71,21 @@ export const loadFaultData = createAsyncThunk<
     switches: SwitchRow[];
     yards: YardRow[];
     workOrders: WorkOrderRow[];
+    solveRecords: SolveRecordRow[];
   },
   void,
   { rejectValue: string }
 >('fault/load', async (_arg, { rejectWithValue }) => {
   try {
-    const [inspections, faults, switches, yards, workOrders] = await Promise.all([
+    const [inspections, faults, switches, yards, workOrders, solveRecords] = await Promise.all([
       listInspections(),
       listFaults(),
       listSwitches(),
       listYards(),
       listWorkOrders(),
+      listSolveRecords(),
     ]);
-    return { inspections, faults, switches, yards, workOrders };
+    return { inspections, faults, switches, yards, workOrders, solveRecords };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '病害数据读取失败');
   }
@@ -237,24 +247,56 @@ export const bulkEscalate = createAsyncThunk<number, string[], { rejectValue: st
   },
 );
 
-/** 手工销号 / 撤销销号 */
+export interface SetFaultStateResult {
+  faultId: string;
+  state: FaultState;
+  /** 本次实际生效的变化：solve=新销号，unsolve=已撤销，kept=原本已销号保持，legacyBlocked=旧数据无来源记录已拦截 */
+  outcome: 'solve' | 'unsolve' | 'kept' | 'legacyBlocked';
+}
+
+/**
+ * 手工销号 / 撤销销号。
+ * - 销号：登记来源 manual；已被作业单或此前手工销过的保持原来源，不覆盖；
+ * - 撤销：有来源记录才回到待修；旧数据没有来源记录时拦截（legacyBlocked），
+ *   需走「强制撤销」人工核对后处理，不能在回退 / 撤销路径里直接抹掉无主销号。
+ */
 export const setFaultState = createAsyncThunk<
-  void,
+  SetFaultStateResult,
   { faultId: string; state: FaultState },
   { rejectValue: string }
 >('fault/setState', async ({ faultId, state }, { getState, rejectWithValue }) => {
   try {
     const slice = (getState() as { fault: FaultStateSlice }).fault;
     const existing = slice.faults.find((item) => item.id === faultId);
-    if (!existing) return;
-    await putFault({
-      ...existing,
-      state,
-      solvedAt: state === 'solved' ? nowIso() : null,
-    });
+    if (!existing) return { faultId, state, outcome: 'kept' };
+    if (state === 'solved') {
+      const result = await manualSolveFault(existing);
+      emitChange();
+      return { faultId, state, outcome: result.kept ? 'kept' : 'solve' };
+    }
+    const result = await manualUnsolveFault(existing);
     emitChange();
+    return { faultId, state, outcome: result.reverted ? 'unsolve' : 'legacyBlocked' };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '更新销号状态失败');
+  }
+});
+
+/**
+ * 人工核对后的强制撤销：仅用于没有来源记录的历史已销号病害（旧单 / 旧版数据），
+ * 必须由页面在待核对清单中由用户显式触发；有来源记录的病害不在此处理。
+ */
+export const forceUnsolveFault = createAsyncThunk<
+  { faultId: string; reverted: boolean },
+  string,
+  { rejectValue: string }
+>('fault/forceUnsolve', async (faultId, { rejectWithValue }) => {
+  try {
+    const result = await forceUnsolveFaultById(faultId);
+    emitChange();
+    return { faultId, reverted: result.reverted };
+  } catch (error) {
+    return rejectWithValue(error instanceof Error ? error.message : '强制撤销失败');
   }
 });
 
@@ -300,6 +342,7 @@ const faultSlice = createSlice({
         state.switches = action.payload.switches;
         state.yards = action.payload.yards;
         state.workOrders = action.payload.workOrders;
+        state.solveRecords = action.payload.solveRecords;
         if (
           !state.activeInspectionId ||
           !action.payload.inspections.some((item) => item.id === state.activeInspectionId)
@@ -323,12 +366,14 @@ interface RootLike {
 
 /** 病害视图：带巡检 / 道岔 / 站场上下文与作业单编排状态 */
 export function selectFaultViews(state: RootLike): FaultView[] {
-  const { faults, inspections, switches, yards, workOrders } = state.fault;
+  const { faults, inspections, switches, yards, workOrders, solveRecords } = state.fault;
+  const recordByFault = new Map(solveRecords.map((item) => [item.faultId, item]));
   return faults.map((fault) => {
     const inspection = inspections.find((item) => item.id === fault.inspectionId);
     const target = inspection ? switches.find((item) => item.id === inspection.switchId) : undefined;
     const yard = target ? yards.find((item) => item.id === target.yardId) : undefined;
     const relatedOrders = workOrders.filter((order) => order.faultIds.includes(fault.id));
+    const record = recordByFault.get(fault.id);
     return {
       ...fault,
       switchId: target?.id ?? '',
@@ -339,8 +384,18 @@ export function selectFaultViews(state: RootLike): FaultView[] {
       inspector: inspection?.inspector ?? '-',
       planned: relatedOrders.length > 0,
       workOrderCodes: relatedOrders.map((order) => order.code),
+      solveSource: record?.source ?? null,
+      solveWorkOrderCode: record?.source === 'workOrder' ? record.workOrderCode : null,
     };
   });
+}
+
+/**
+ * 待人工核对的销号：已销号但没有来源记录的历史数据（旧单 / 旧版数据）。
+ * 这些销号不允许在作业单回退或普通撤销时直接抹掉，需在病害页列出由人工核对后强制撤销。
+ */
+export function selectLegacySolvedFaults(state: RootLike): FaultView[] {
+  return selectFaultViews(state).filter((item) => item.state === 'solved' && item.solveSource === null);
 }
 
 /** 巡检视图：带道岔上下文与病害统计 */

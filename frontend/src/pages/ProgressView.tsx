@@ -27,16 +27,24 @@ import {
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import AssignmentTurnedInIcon from '@mui/icons-material/AssignmentTurnedIn';
+import UndoIcon from '@mui/icons-material/Undo';
 import DownloadIcon from '@mui/icons-material/Download';
 import { useAppDispatch, useAppSelector } from '../hooks/useAppStore';
-import { advanceWorkOrder, selectWindowStats, selectWorkOrderViews } from '../stores/workOrderStore';
-import { selectFaultViews } from '../stores/faultStore';
 import {
+  advanceWorkOrder,
+  rollbackWorkOrder,
+  selectWindowStats,
+  selectWorkOrderViews,
+} from '../stores/workOrderStore';
+import { selectFaultViews, selectLegacySolvedFaults } from '../stores/faultStore';
+import {
+  WORK_ORDER_ROLLBACK_FLOW,
   WORK_ORDER_STATE_FLOW,
   WORK_ORDER_STATE_LABEL,
   type WorkOrderState,
 } from '../types/workOrder';
 import { FAULT_SEVERITY_LABEL } from '../types/fault';
+import { SOLVE_SOURCE_LABEL } from '../types/solveRecord';
 import { ROUTES } from '../router/routes';
 import { formatDuration, nowDateTime } from '../utils/window';
 import { downloadCsv, share } from '../utils/format';
@@ -52,6 +60,7 @@ export default function ProgressView() {
   const navigate = useNavigate();
   const orders = useAppSelector(selectWorkOrderViews);
   const faults = useAppSelector(selectFaultViews);
+  const legacySolvedFaults = useAppSelector(selectLegacySolvedFaults);
   const stats = useAppSelector(selectWindowStats);
 
   const keyword = useKeywordFilter();
@@ -110,6 +119,28 @@ export default function ProgressView() {
     }
   };
 
+  const rollback = async (id: string, next: WorkOrderState, code: string): Promise<void> => {
+    try {
+      const result = await dispatch(rollbackWorkOrder({ id, next })).unwrap();
+      if (result.revertedCount > 0) {
+        setToast(
+          `${code} 已退回「${WORK_ORDER_STATE_LABEL[next]}」，撤销本单带出的销号 ${result.revertedCount} 处` +
+            (result.unattributedFaultIds.length > 0
+              ? `；另有 ${result.unattributedFaultIds.length} 处非本单销号已保留，见下方待人工核对`
+              : ''),
+        );
+      } else if (result.unattributedFaultIds.length > 0) {
+        setToast(
+          `${code} 已退回「${WORK_ORDER_STATE_LABEL[next]}」；关联病害的销号均非本单带出，已全部保留，见下方待人工核对`,
+        );
+      } else {
+        setToast(`${code} 已退回「${WORK_ORDER_STATE_LABEL[next]}」，本单未带出销号`);
+      }
+    } catch (error) {
+      setToast(`回退失败：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  };
+
   const exportCsv = (): void => {
     const header = ['作业单', '状态', '天窗起', '天窗止', '时长(分钟)', '负责人', '作业人员', '机具', '关联病害', '待销号', '冲突'];
     const body = rows.map((order) => [
@@ -139,7 +170,7 @@ export default function ProgressView() {
             作业进度与销号回写
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            按天窗批次推进状态：待编排 → 已下达 → 作业中 → 已完成；推进到已完成时自动回写关联病害销号。
+            按天窗批次推进状态：待编排 → 已下达 → 作业中 → 已完成；完成时回写仍待修病害的销号，退回时只撤销本单带出的销号。
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -269,8 +300,28 @@ export default function ProgressView() {
                           推进为{WORK_ORDER_STATE_LABEL[next]}
                         </Button>
                       ))}
+                      {WORK_ORDER_ROLLBACK_FLOW[order.state].map((prev) => (
+                        <Button
+                          key={prev}
+                          size="small"
+                          variant="outlined"
+                          color="warning"
+                          startIcon={<UndoIcon />}
+                          onClick={() => void rollback(order.id, prev, order.code)}
+                        >
+                          退回{WORK_ORDER_STATE_LABEL[prev]}
+                        </Button>
+                      ))}
                       {order.state === 'done' ? (
-                        <Chip icon={<CheckCircleIcon />} color="success" label="已完成并回写销号" />
+                        <Tooltip
+                          title={
+                            order.solvedByOrderCount > 0
+                              ? `本单实际带出销号 ${order.solvedByOrderCount} 处，退回作业中时仅撤销这些销号`
+                              : '本单未带出任何销号，退回只改作业单状态'
+                          }
+                        >
+                          <Chip icon={<CheckCircleIcon />} color="success" label="已完成并回写销号" />
+                        </Tooltip>
                       ) : null}
                     </Stack>
                   </Stack>
@@ -283,8 +334,10 @@ export default function ProgressView() {
                       color={order.state === 'done' ? 'success' : 'primary'}
                     />
                     <Typography variant="caption" color="text.secondary">
-                      进度 {progressPercent}% · 关联病害 {order.faultIds.length} 处（待销号 {order.pendingFaultCount}）· 作业人员{' '}
-                      {order.members.join('、')} · 机具 {order.machines.join('、')}
+                      进度 {progressPercent}% · 关联病害 {order.faultIds.length} 处（待销号 {order.pendingFaultCount}
+                      ，本单带出销号 {order.solvedByOrderCount}
+                      {order.unattributedSolvedCount > 0 ? `，无来源待核对 ${order.unattributedSolvedCount}` : ''}
+                      ）· 作业人员 {order.members.join('、')} · 机具 {order.machines.join('、')}
                     </Typography>
                   </Box>
 
@@ -297,6 +350,7 @@ export default function ProgressView() {
                           <TableCell>等级</TableCell>
                           <TableCell>巡检日期</TableCell>
                           <TableCell>销号状态</TableCell>
+                          <TableCell>销号来源</TableCell>
                           <TableCell>销号时间</TableCell>
                         </TableRow>
                       </TableHead>
@@ -328,12 +382,41 @@ export default function ProgressView() {
                                 label={fault.state === 'solved' ? '已销号' : '待修'}
                               />
                             </TableCell>
+                            <TableCell>
+                              {fault.state === 'solved' ? (
+                                fault.solveSource ? (
+                                  <Tooltip
+                                    title={
+                                      fault.solveSource === 'workOrder' && fault.solveWorkOrderCode
+                                        ? `由作业单 ${fault.solveWorkOrderCode} 完成时带出销号`
+                                        : '病害评定页手工销号'
+                                    }
+                                  >
+                                    <Chip
+                                      size="small"
+                                      color={fault.solveSource === 'workOrder' ? 'info' : 'default'}
+                                      label={
+                                        fault.solveSource === 'workOrder' && fault.solveWorkOrderCode
+                                          ? `${SOLVE_SOURCE_LABEL.workOrder} · ${fault.solveWorkOrderCode}`
+                                          : SOLVE_SOURCE_LABEL[fault.solveSource]
+                                      }
+                                    />
+                                  </Tooltip>
+                                ) : (
+                                  <Chip size="small" color="warning" variant="outlined" label="无来源记录·待核对" />
+                                )
+                              ) : (
+                                <Typography variant="caption" color="text.secondary">
+                                  —
+                                </Typography>
+                              )}
+                            </TableCell>
                             <TableCell>{fault.solvedAt ?? '—'}</TableCell>
                           </TableRow>
                         ))}
                         {relatedFaults.length === 0 ? (
                           <TableRow>
-                            <TableCell colSpan={6} align="center">
+                            <TableCell colSpan={7} align="center">
                               <Typography variant="caption" color="text.secondary">
                                 关联病害已被删除或尚未加载
                               </Typography>
@@ -350,9 +433,30 @@ export default function ProgressView() {
         )}
       </Box>
 
+      {legacySolvedFaults.length > 0 ? (
+        <Alert
+          severity="warning"
+          sx={{ mt: 2 }}
+          action={
+            <Button color="inherit" size="small" onClick={() => navigate(ROUTES.faults)}>
+              去核对处理
+            </Button>
+          }
+        >
+          有 {legacySolvedFaults.length} 处已销号病害缺少销号来源记录（旧单 / 旧版数据）。
+          作业单回退不会撤销这些销号，请在「病害评定与销号」页逐个人工核对后处理：
+          {legacySolvedFaults
+            .slice(0, 6)
+            .map((item) => `${item.yardName} ${item.switchCode} ${item.part}/${item.type}`)
+            .join('；')}
+          {legacySolvedFaults.length > 6 ? ' 等' : ''}
+        </Alert>
+      ) : null}
+
       <Alert severity="info" sx={{ mt: 2 }}>
-        说明：天窗作业单推进到「已完成」时，系统会把该单关联的全部待修病害一次性置为已销号并记录销号时间，
-        可在「病害评定与销号」页撤销销号。
+        说明：作业单推进到「已完成」时，只把该单关联的<strong>仍待修</strong>病害置为已销号并登记来源为该单；
+        此前手工销过或被别的单先销过的病害保留原销号。作业单退回（已完成→作业中、已下达→待编排）时，
+        <strong>只撤销本单实际带出的销号</strong>；同一病害关联多张单时，销号归最早完成的单，后来那张退回只改作业单状态、不动病害。
       </Alert>
 
       <Snackbar

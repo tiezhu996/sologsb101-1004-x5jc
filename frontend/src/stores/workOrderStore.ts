@@ -5,21 +5,25 @@
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import {
   ROW_REVISION,
+  completeWorkOrderSolve,
   listFaults,
   listInspections,
+  listSolveRecords,
   listSwitches,
   listWorkOrders,
   listYards,
-  putFaults,
   putWorkOrder,
   removeWorkOrder,
+  rollbackWorkOrderSolve,
   type FaultRow,
   type InspectionRow,
+  type SolveRecordRow,
   type SwitchRow,
   type WorkOrderRow,
   type YardRow,
 } from '../utils/db';
 import {
+  WORK_ORDER_ROLLBACK_FLOW,
   WORK_ORDER_STATE_FLOW,
   buildWorkOrderCode,
   type WorkOrderDraft,
@@ -41,6 +45,8 @@ export interface WorkOrderStateSlice {
   inspections: InspectionRow[];
   switches: SwitchRow[];
   yards: YardRow[];
+  /** 销号来源记录（决定作业单回退时能撤销哪些销号） */
+  solveRecords: SolveRecordRow[];
   /** 编排时勾选的病害 */
   selectedFaultIds: string[];
   loading: boolean;
@@ -53,6 +59,7 @@ const initialState: WorkOrderStateSlice = {
   inspections: [],
   switches: [],
   yards: [],
+  solveRecords: [],
   selectedFaultIds: [],
   loading: false,
   error: '',
@@ -65,19 +72,21 @@ export const loadWorkOrderData = createAsyncThunk<
     inspections: InspectionRow[];
     switches: SwitchRow[];
     yards: YardRow[];
+    solveRecords: SolveRecordRow[];
   },
   void,
   { rejectValue: string }
 >('workOrder/load', async (_arg, { rejectWithValue }) => {
   try {
-    const [workOrders, faults, inspections, switches, yards] = await Promise.all([
+    const [workOrders, faults, inspections, switches, yards, solveRecords] = await Promise.all([
       listWorkOrders(),
       listFaults(),
       listInspections(),
       listSwitches(),
       listYards(),
+      listSolveRecords(),
     ]);
-    return { workOrders, faults, inspections, switches, yards };
+    return { workOrders, faults, inspections, switches, yards, solveRecords };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '作业单读取失败');
   }
@@ -150,7 +159,8 @@ export const updateWorkOrder = createAsyncThunk<
 
 /**
  * 推进作业单状态。
- * 推进到「已完成」时，把关联病害批量置为已销号（回写销号）。
+ * 推进到「已完成」时，只把仍待修的关联病害批量置为已销号（回写销号），
+ * 并逐条登记销号来源为本单；此前已手工销过或被别的单先销的病害保持原状。
  */
 export const advanceWorkOrder = createAsyncThunk<
   { state: WorkOrderState; solvedCount: number },
@@ -164,27 +174,56 @@ export const advanceWorkOrder = createAsyncThunk<
     const allowed = WORK_ORDER_STATE_FLOW[existing.state];
     if (!allowed.includes(next)) return { state: existing.state, solvedCount: 0 };
 
-    let solvedCount = 0;
+    const updatedAt = nowDateTime();
     if (next === 'done') {
-      const related = state.faults.filter(
-        (item) => existing.faultIds.includes(item.id) && item.state === 'pending',
-      );
-      if (related.length > 0) {
-        await putFaults(
-          related.map((item) => ({ ...item, state: 'solved' as const, solvedAt: nowDateTime() })),
-        );
-        solvedCount = related.length;
-      }
+      const { solvedFaultIds } = await completeWorkOrderSolve({
+        ...existing,
+        state: next,
+        updatedAt,
+      });
+      emitChange();
+      return { state: next, solvedCount: solvedFaultIds.length };
     }
-    await putWorkOrder({
-      ...existing,
-      state: next,
-      updatedAt: nowDateTime(),
-    });
+    await putWorkOrder({ ...existing, state: next, updatedAt });
     emitChange();
-    return { state: next, solvedCount };
+    return { state: next, solvedCount: 0 };
   } catch (error) {
     return rejectWithValue(error instanceof Error ? error.message : '推进作业单失败');
+  }
+});
+
+/**
+ * 回退作业单状态（仅支持已完成→作业中、已下达→待编排）。
+ * 回退时只撤销本单实际带出的销号（销号记录 source 为本单）；
+ * 手工销过的、别的单先销过的保留；旧单没有来源记录的已销号病害列入 unattributedFaultIds
+ * 返回给页面提示人工核对，不直接撤销。
+ */
+export const rollbackWorkOrder = createAsyncThunk<
+  {
+    state: WorkOrderState;
+    revertedCount: number;
+    unattributedFaultIds: string[];
+  },
+  { id: string; next: WorkOrderState },
+  { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
+>('workOrder/rollback', async ({ id, next }, { getState, rejectWithValue }) => {
+  try {
+    const state = getState().workOrder;
+    const existing = state.workOrders.find((item) => item.id === id);
+    if (!existing) return { state: next, revertedCount: 0, unattributedFaultIds: [] };
+    const allowedNext = WORK_ORDER_ROLLBACK_FLOW[existing.state];
+    if (!allowedNext.includes(next)) {
+      return { state: existing.state, revertedCount: 0, unattributedFaultIds: [] };
+    }
+    const result = await rollbackWorkOrderSolve(existing, next);
+    emitChange();
+    return {
+      state: next,
+      revertedCount: result.revertedFaultIds.length,
+      unattributedFaultIds: result.unattributedFaultIds,
+    };
+  } catch (error) {
+    return rejectWithValue(error instanceof Error ? error.message : '回退作业单失败');
   }
 });
 
@@ -230,6 +269,7 @@ const workOrderSlice = createSlice({
         state.inspections = action.payload.inspections;
         state.switches = action.payload.switches;
         state.yards = action.payload.yards;
+        state.solveRecords = action.payload.solveRecords;
         const validIds = new Set(action.payload.faults.map((item) => item.id));
         state.selectedFaultIds = state.selectedFaultIds.filter((id) => validIds.has(id));
       })
@@ -249,7 +289,8 @@ interface RootLike {
 
 /** 作业单视图：带病害标签、时长、冲突与未销号数量 */
 export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
-  const { workOrders, faults, inspections, switches, yards } = state.workOrder;
+  const { workOrders, faults, inspections, switches, yards, solveRecords } = state.workOrder;
+  const recordByFault = new Map(solveRecords.map((item) => [item.faultId, item]));
   const switchIdOfFault = (fault: FaultRow): string | undefined => {
     const inspection = inspections.find((row) => row.id === fault.inspectionId);
     return inspection?.switchId;
@@ -303,6 +344,13 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
         memberConflict: memberConflicts.length > 0,
         machineConflict: machineConflicts.length > 0,
         pendingFaultCount: related.filter((item) => item.state === 'pending').length,
+        solvedByOrderCount: related.filter((item) => {
+          const record = recordByFault.get(item.id);
+          return record?.source === 'workOrder' && record.workOrderId === order.id;
+        }).length,
+        unattributedSolvedCount: related.filter(
+          (item) => item.state === 'solved' && !recordByFault.has(item.id),
+        ).length,
       };
     })
     .sort((a, b) => a.windowStart.localeCompare(b.windowStart));
